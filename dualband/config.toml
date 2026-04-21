@@ -1,0 +1,21 @@
+[general]
+location = "LI.VFX Alverca"
+channels = ["#ping", "#lisboa", "#testes"]
+cross_band_grace_seconds = 8
+
+[[bands]]
+name = "433"
+label = "433 MHz"
+port = "/dev/ttyUSB0"
+
+[[bands]]
+name = "868"
+label = "868 MHz"
+port = "/dev/ttyUSB1"
+
+[dashboard]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+path = "./stats.db"
