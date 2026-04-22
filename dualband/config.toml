@@ -3,9 +3,8 @@
 # ============================================================
 
 [general]
-bot_name = "Echo-Alverca"
-location = "LI.VFX Alverca"
-monitor_channels = ["QSO", "ping", "testes", "lisboa"]
+node_name = "Echo-Alverca"
+monitor_channels = ["QSO", "#ping", "#testes", "#lisboa"]
 cross_band_grace_seconds = 8
 
 # ============================================================
@@ -13,21 +12,22 @@ cross_band_grace_seconds = 8
 # ============================================================
 
 [[bands]]
-name  = "433"
-label = "433 MHz"
-port  = "/dev/ttyUSB0"
+name = "433MHz"
+port = "/dev/ttyUSB0"
+baud = 115200
 
 [[bands]]
-name  = "868"
-label = "868 MHz"
-port  = "/dev/ttyUSB1"
+name = "868MHz"
+port = "/dev/ttyUSB1"
+baud = 115200
 
 # ============================================================
 #  RESPONSE TEMPLATES
 # ============================================================
 
 [responses]
-ping = "@[{sender}] Aterrou em Alverca em [{first_band}] com {hops_label} via {path} "
+ping      = "@[{sender}] Aterrou em Alverca {hops_label} {first_band} via {path}"
+ping_dual = "@[{sender}] Aterrou em Alverca {hops_label} {first_band} via {path} | Bridge OK {second_band}"
 
 # ============================================================
 #  DASHBOARD
