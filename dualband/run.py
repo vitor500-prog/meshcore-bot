@@ -1,169 +1,164 @@
 import asyncio
-import sys
 import time
+import sys
 
 try:
     import tomllib
-except ImportError:
+except ModuleNotFoundError:
     import tomli as tomllib
 
-from dualband.stats_db   import StatsDB
-from dualband.correlator import Correlator
-from dualband.dashboard  import start_dashboard
+from meshcore import MeshCore
 
-try:
-    from meshcore import MeshCore
-except ImportError:
-    print("ERROR: meshcore library not found. Run: pip install meshcore")
-    sys.exit(1)
-
-# ── Load config ────────────────────────────────────────────────────────────────
+# ── Load config ────────────────────────────────────────────────
 with open("config.toml", "rb") as f:
     cfg = tomllib.load(f)
 
-BOT_NAME  = cfg["general"]["bot_name"]
-LOCATION  = cfg["general"]["location"]
-CHANNELS  = cfg["general"]["monitor_channels"]
-GRACE     = cfg["general"].get("cross_band_grace_seconds", 8)
-DB_PATH   = cfg["database"]["path"]
-DASH_HOST = cfg["dashboard"]["host"]
-DASH_PORT = cfg["dashboard"]["port"]
-BANDS     = cfg["bands"]
-RESPONSES = cfg["responses"]
+GRACE       = cfg["general"]["cross_band_grace_seconds"]  # 8
+CHANNELS    = cfg["QSO"]["monitor_channels"]
+BANDS       = cfg["bands"]
+RESP_SINGLE = cfg["responses"]["ping"]
+RESP_DUAL   = cfg["responses"]["ping_dual"]
 
-# ── Init DB & correlator ───────────────────────────────────────────────────────
-db   = StatsDB(DB_PATH)
-corr = Correlator(window=GRACE)
+# ── Correlator ─────────────────────────────────────────────────
+correlator = {}
+corr_lock  = asyncio.Lock()
 
-# ── Shared reply state (between both band handlers) ────────────────────────────
-# corr_key → {"ts": float, "band": "433" or "868"}
-replied_keys  = {}
-replied_lock  = asyncio.Lock()   # async-safe lock
-REPLY_WINDOW  = 30  # seconds — won't reply same message twice within this window
-
-# ── Shared MeshCore connections, keyed by band name ───────────────────────────
-# So band 433 handler can ask band 433 radio to transmit
-mc_connections = {}   # {"433": MeshCore_instance, "868": MeshCore_instance}
-
-
-def build_hops_label(hops):
-    """Convert hop count to Portuguese label."""
-    if hops is None or hops == 0:
+# ── Helpers ────────────────────────────────────────────────────
+def build_hops_label(hops: int) -> str:
+    if hops == 0:
         return "direto"
-    elif hops == 1:
-        return "1 salto"
+    if hops == 1:
+        return "1h"
+    return f"{hops}h"
+
+
+async def send_reply(mc, channel, sender, hops_label, first_band, path, second_band=None):
+    if second_band:
+        text = RESP_DUAL.format(
+            sender      = sender,
+            hops_label  = hops_label,
+            first_band  = first_band,
+            path        = path,
+            second_band = second_band,
+        )
     else:
-        return f"{hops} saltos"
+        text = RESP_SINGLE.format(
+            sender     = sender,
+            hops_label = hops_label,
+            first_band = first_band,
+            path       = path,
+        )
+    await mc.send_channel_message(channel, text)
+    print(f"  📤 Sent: {text}")
 
 
-def build_reply(template_key, sender, channel, band_label, first_band, hops):
-    """Format a response template from config.toml."""
-    template   = RESPONSES.get(template_key, "")
+# ── Grace window timer ─────────────────────────────────────────
+async def grace_timer(corr_key):
+    """Wait GRACE seconds then fire the reply."""
+    await asyncio.sleep(GRACE)
+
+    async with corr_lock:
+        entry = correlator.get(corr_key)
+        if entry is None or entry["sent"]:
+            return
+        entry["sent"] = True
+
+    print(f"\n[REPLY] Grace window expired for {entry['sender']}")
+    await send_reply(
+        entry["mc"],
+        entry["channel"],
+        entry["sender"],
+        entry["hops_label"],
+        entry["first_band"],
+        entry["path"],
+        entry["second_band"],   # None if only one band received
+    )
+
+
+# ── Message handler ────────────────────────────────────────────
+async def handle_message(mc, band_name, p):
+    try:
+        text    = getattr(p, "text",     "").strip()
+        sender  = getattr(p, "sender",   "unknown")
+        hops    = getattr(p, "path_len", 0)
+        path    = getattr(p, "path",     "")
+        channel = getattr(p, "channel",  CHANNELS[0])
+    except Exception as e:
+        print(f"[{band_name}] ⚠️  Error reading message: {e}")
+        return
+
+    if channel not in CHANNELS:
+        return
+
+    if not text.lower().startswith("!ping"):
+        return
+
     hops_label = build_hops_label(hops)
+    corr_key   = (sender, hops, path)
 
-    return template.format(
-        sender      = sender,
-        hops_label  = hops_label,
-        path        = band_label,
-        band        = band_label,
-        first_band  = first_band,
-        hops        = hops if hops is not None else "?",
-        channel     = channel,
-        location    = LOCATION,
-        bot_name    = BOT_NAME,
-    )
+    print(f"[{band_name}] #ping | {sender}: {text} (hops={hops}, path={path})")
+
+    async with corr_lock:
+        entry = correlator.get(corr_key)
+
+        if entry is None:
+            # ── First band to receive ──────────────────────────
+            correlator[corr_key] = {
+                "sender":      sender,
+                "hops_label":  hops_label,
+                "first_band":  band_name,
+                "path":        path,
+                "channel":     channel,
+                "mc":          mc,
+                "second_band": None,
+                "sent":        False,
+                "ts":          time.time(),
+            }
+            print(f"[{band_name}] ⏳ First band — waiting {GRACE}s...")
+            asyncio.create_task(grace_timer(corr_key))
+
+        elif not entry["sent"] and entry["second_band"] is None:
+            # ── Second band arrives within grace window ────────
+            entry["second_band"] = band_name
+            print(f"[{band_name}] ✅ Second band confirmed — Bridge OK {band_name}")
+
+        else:
+            print(f"[{band_name}] ⏭️  Skipped — already processed")
 
 
-async def handle_band(band_cfg):
-    name  = band_cfg["name"]    # "433" or "868"
-    label = band_cfg["label"]   # "433 MHz" or "868 MHz"
-    port  = band_cfg["port"]    # "/dev/ttyUSB0" etc.
+# ── Band listener ──────────────────────────────────────────────
+async def listen_band(band):
+    name = band["name"]
+    port = band["port"]
+    baud = band["baud"]
 
+    mc = MeshCore()
     print(f"[{name}] Connecting on {port}...")
-    mc = await MeshCore.create_serial(port)
-    await mc.connect()
 
-    # ── Store connection so other tasks can reference it if needed
-    mc_connections[name] = mc
-    print(f"[{name}] ✅ Connected on {port}")
+    try:
+        await mc.connect_serial(port, baud)
+        print(f"[{name}] ✅ Connected on {port}")
+    except Exception as e:
+        print(f"[{name}] ❌ Failed to connect: {e}")
+        return
 
-    async for event in mc.subscribe_channel_messages():
-        try:
-            p       = event.payload
-            sender  = getattr(p, "sender",       "unknown")
-            channel = getattr(p, "channel_name", "unknown")
-            text    = (getattr(p, "text", "") or "").strip()
-            hops    = getattr(p, "path_len",     None)
-
-            # Only process monitored channels
-            if channel not in CHANNELS:
-                continue
-
-            print(f"[{name}] #{channel} | {sender}: {text} (hops={hops})")
-
-            # Record in DB
-            corr_key = corr.key(sender, channel, text)
-            is_first = db.record_reception(corr_key, name, sender, channel, text, hops)
-
-            # ── Ping response ──────────────────────────────────────────────────
-            if text.lower().startswith("!ping"):
-                now = time.time()
-
-                async with replied_lock:
-                    existing = replied_keys.get(corr_key)
-
-                    if existing is None or (now - existing["ts"]) > REPLY_WINDOW:
-                        # ✅ This band wins — it replies via ITS OWN radio
-                        replied_keys[corr_key] = {"ts": now, "band": name}
-                        should_reply = True
-                        first_band   = label   # this band received it first
-                    else:
-                        # ⚠️ Other band already replied — skip
-                        should_reply = False
-                        first_band   = replied_keys[corr_key]["band"] + " MHz"
-                        print(
-                            f"[{name}] ⏩ Skipped — already replied via "
-                            f"{first_band} "
-                            f"({int(now - existing['ts'])}s ago)"
-                        )
-
-                if should_reply:
-                    reply = build_reply(
-                        template_key = "ping",
-                        sender       = sender,
-                        channel      = channel,
-                        band_label   = label,
-                        first_band   = label,   # this IS the first band
-                        hops         = hops,
-                    )
-
-                    # ✅ Reply goes through THIS band's radio (mc = this band)
-                    await mc.send_channel_message(channel, reply)
-                    print(f"[{name}] 📤 Replied via {label}: {reply}")
-
-        except Exception as e:
-            print(f"[{name}] ⚠️ Error: {e}")
+    async for p in mc.messages():
+        await handle_message(mc, name, p)
 
 
-async def finalizer():
-    """Periodically mark stale messages as finalized in DB."""
-    while True:
-        db.finalize_stale(GRACE)
-        await asyncio.sleep(5)
-
-
+# ── Main ───────────────────────────────────────────────────────
 async def main():
-    print(f"🤖 {BOT_NAME} starting...")
-    print(f"📡 Monitoring channels: {CHANNELS}")
-    print(f"🔌 Bands: {[b['label'] + ' on ' + b['port'] for b in BANDS]}")
+    print(f"\n🤖 {cfg['general']['node_name']} starting...")
+    print(f"📡 Channels: {CHANNELS}")
+    print(f"🔌 Bands: {[f\"{b['name']} on {b['port']}\" for b in BANDS]}")
+    print(f"⏳ Grace window: {GRACE} seconds\n")
 
-    start_dashboard(db, host=DASH_HOST, port=DASH_PORT)
-
-    await asyncio.gather(
-        *[handle_band(b) for b in BANDS],
-        finalizer()
-    )
+    await asyncio.gather(*[listen_band(b) for b in BANDS])
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped.")
+        sys.exit(0)
