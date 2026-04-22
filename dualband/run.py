@@ -31,17 +31,23 @@ DASH_PORT = cfg["dashboard"]["port"]
 BANDS     = cfg["bands"]
 RESPONSES = cfg["responses"]
 
-# ── Init DB & correlator ────────────────────────────────────────────────────────
+# ── Init DB & correlator ───────────────────────────────────────────────────────
 db   = StatsDB(DB_PATH)
 corr = Correlator(window=GRACE)
 
-# Deduplicate replies: don't reply twice to same message on both bands
+# ── Shared reply state (between both band handlers) ────────────────────────────
+# corr_key → {"ts": float, "band": "433" or "868"}
 replied_keys  = {}
-REPLY_WINDOW  = 30  # seconds
+replied_lock  = asyncio.Lock()   # async-safe lock
+REPLY_WINDOW  = 30  # seconds — won't reply same message twice within this window
+
+# ── Shared MeshCore connections, keyed by band name ───────────────────────────
+# So band 433 handler can ask band 433 radio to transmit
+mc_connections = {}   # {"433": MeshCore_instance, "868": MeshCore_instance}
 
 
 def build_hops_label(hops):
-    """Convert hop count to Portuguese label — matches your original style."""
+    """Convert hop count to Portuguese label."""
     if hops is None or hops == 0:
         return "direto"
     elif hops == 1:
@@ -51,16 +57,16 @@ def build_hops_label(hops):
 
 
 def build_reply(template_key, sender, channel, band_label, first_band, hops):
-    """Format a response template from config.toml with all variables."""
+    """Format a response template from config.toml."""
     template   = RESPONSES.get(template_key, "")
     hops_label = build_hops_label(hops)
 
     return template.format(
         sender      = sender,
         hops_label  = hops_label,
-        path        = band_label,           # e.g. "433 MHz"
+        path        = band_label,
         band        = band_label,
-        first_band  = first_band,           # which band received it first
+        first_band  = first_band,
         hops        = hops if hops is not None else "?",
         channel     = channel,
         location    = LOCATION,
@@ -69,14 +75,16 @@ def build_reply(template_key, sender, channel, band_label, first_band, hops):
 
 
 async def handle_band(band_cfg):
-    name  = band_cfg["name"]   # "433" or "868"
-    label = band_cfg["label"]  # "433 MHz" or "868 MHz"
-    port  = band_cfg["port"]   # "/dev/ttyUSB0" etc.
+    name  = band_cfg["name"]    # "433" or "868"
+    label = band_cfg["label"]   # "433 MHz" or "868 MHz"
+    port  = band_cfg["port"]    # "/dev/ttyUSB0" etc.
 
     print(f"[{name}] Connecting on {port}...")
-
     mc = await MeshCore.create_serial(port)
     await mc.connect()
+
+    # ── Store connection so other tasks can reference it if needed
+    mc_connections[name] = mc
     print(f"[{name}] ✅ Connected on {port}")
 
     async for event in mc.subscribe_channel_messages():
@@ -93,32 +101,45 @@ async def handle_band(band_cfg):
 
             print(f"[{name}] #{channel} | {sender}: {text} (hops={hops})")
 
-            # Record in DB (returns True if first reception of this message)
-            corr_key   = corr.key(sender, channel, text)
-            is_first   = db.record_reception(corr_key, name, sender, channel, text, hops)
-            first_band = label if is_first else "?"
+            # Record in DB
+            corr_key = corr.key(sender, channel, text)
+            is_first = db.record_reception(corr_key, name, sender, channel, text, hops)
 
             # ── Ping response ──────────────────────────────────────────────────
             if text.lower().startswith("!ping"):
-                now  = time.time()
-                last = replied_keys.get(corr_key, 0)
+                now = time.time()
 
-                if now - last > REPLY_WINDOW:
-                    replied_keys[corr_key] = now
+                async with replied_lock:
+                    existing = replied_keys.get(corr_key)
 
+                    if existing is None or (now - existing["ts"]) > REPLY_WINDOW:
+                        # ✅ This band wins — it replies via ITS OWN radio
+                        replied_keys[corr_key] = {"ts": now, "band": name}
+                        should_reply = True
+                        first_band   = label   # this band received it first
+                    else:
+                        # ⚠️ Other band already replied — skip
+                        should_reply = False
+                        first_band   = replied_keys[corr_key]["band"] + " MHz"
+                        print(
+                            f"[{name}] ⏩ Skipped — already replied via "
+                            f"{first_band} "
+                            f"({int(now - existing['ts'])}s ago)"
+                        )
+
+                if should_reply:
                     reply = build_reply(
                         template_key = "ping",
                         sender       = sender,
                         channel      = channel,
                         band_label   = label,
-                        first_band   = label,
+                        first_band   = label,   # this IS the first band
                         hops         = hops,
                     )
 
+                    # ✅ Reply goes through THIS band's radio (mc = this band)
                     await mc.send_channel_message(channel, reply)
-                    print(f"[{name}] 📤 Replied: {reply}")
-                else:
-                    print(f"[{name}] ⏩ Skipped duplicate reply (already replied {int(now-last)}s ago)")
+                    print(f"[{name}] 📤 Replied via {label}: {reply}")
 
         except Exception as e:
             print(f"[{name}] ⚠️ Error: {e}")
